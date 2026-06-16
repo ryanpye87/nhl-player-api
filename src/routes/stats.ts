@@ -1,5 +1,14 @@
 import { Router, Request, Response } from "express"
 import AggregatedStats from "../models/AggregatedStats"
+import {
+  MIN_GP_SKATER,
+  MIN_GP_GOALIE,
+  INVERTED_SKATER,
+  INVERTED_GOALIE,
+  SKATER_KEYS,
+  GOALIE_KEYS,
+  computePercentiles,
+} from "../utils/percentiles"
 
 const router = Router()
 
@@ -7,14 +16,6 @@ const router = Router()
 
 const NHL_STATS_API = "https://api.nhle.com/stats/rest/en"
 const CURRENT_SEASON = "20252026"
-
-/** Minimum games played to qualify for percentile rankings */
-const MIN_GP_SKATER = 10
-const MIN_GP_GOALIE = 5
-
-/** Stats that are inverted — lower raw value = better (higher percentile) */
-const INVERTED_SKATER = new Set(["pim"])
-const INVERTED_GOALIE = new Set(["goalsAgainstAvg", "losses"])
 
 // ── POST /aggregate ─────────────────────────────────────────────────
 
@@ -164,47 +165,17 @@ router.get("/percentiles/:playerId", async (req: Request, res: Response) => {
 
     const minGp = target.isGoalie ? MIN_GP_GOALIE : MIN_GP_SKATER
     const invertedSet = target.isGoalie ? INVERTED_GOALIE : INVERTED_SKATER
+    const statKeys = target.isGoalie ? GOALIE_KEYS : SKATER_KEYS
 
-    // All qualified peers of the same type
     const peers = await AggregatedStats.find({
       isGoalie: target.isGoalie,
       gamesPlayed: { $gte: minGp },
     })
 
-    if (peers.length === 0) {
-      return res.json({
-        playerId: target.playerId,
-        fullName: target.fullName,
-        position: target.position,
-        season: target.season,
-        percentiles: {},
-      })
-    }
-
-    // Stat keys to compute percentiles for
-    const statKeys = target.isGoalie
-      ? ["gamesPlayed", "wins", "losses", "otLosses", "shutouts", "savePctg", "goalsAgainstAvg", "avgToi"]
-      : ["gamesPlayed", "goals", "assists", "points", "plusMinus", "shots", "shootingPctg", "avgToi", "hits", "blockedShots", "pim"]
-
-    const percentiles: Record<string, number> = {}
-
-    for (const key of statKeys) {
-      const targetValue = (target as any)[key] ?? 0
-
-      // Count players with lower (or higher for inverted) values
-      let lowerCount = 0
-      for (const peer of peers) {
-        const peerValue = (peer as any)[key] ?? 0
-        if (invertedSet.has(key)) {
-          if (peerValue > targetValue) lowerCount++
-        } else {
-          if (peerValue < targetValue) lowerCount++
-        }
-      }
-
-      const pct = Math.round((lowerCount / peers.length) * 99)
-      percentiles[key] = Math.min(99, Math.max(0, pct))
-    }
+    const percentiles =
+      peers.length > 0
+        ? computePercentiles(target, peers, statKeys, invertedSet)
+        : {}
 
     res.json({
       playerId: target.playerId,
@@ -216,6 +187,70 @@ router.get("/percentiles/:playerId", async (req: Request, res: Response) => {
   } catch (err) {
     console.error("Percentile computation failed:", err)
     res.status(500).json({ error: "Failed to compute percentiles" })
+  }
+})
+
+// ── POST /batch ──────────────────────────────────────────────────────
+// Returns aggregated stats + percentiles for multiple players in one call.
+// Collapses N×2 per-player calls into 1 request and shares peer queries.
+
+router.post("/batch", async (req: Request, res: Response) => {
+  try {
+    const { ids } = req.body as { ids: number[] }
+
+    if (!Array.isArray(ids) || ids.length === 0 || ids.length > 100) {
+      return res
+        .status(400)
+        .json({ error: "ids must be an array of 1–100 player IDs" })
+    }
+
+    // ── 1. Fetch aggregated stats for all requested players ──────────
+    const aggregated = await AggregatedStats.find({
+      playerId: { $in: ids },
+    })
+
+    // ── 2. Percentiles — group by position type, fetch peers once ────
+    const percentiles: any[] = []
+
+    const skaters = aggregated.filter(
+      (p) => !p.isGoalie && p.gamesPlayed >= MIN_GP_SKATER,
+    )
+    const goalies = aggregated.filter(
+      (p) => p.isGoalie && p.gamesPlayed >= MIN_GP_GOALIE,
+    )
+
+    // Skater percentiles
+    if (skaters.length > 0) {
+      const peers = await AggregatedStats.find({
+        isGoalie: false,
+        gamesPlayed: { $gte: MIN_GP_SKATER },
+      })
+      for (const player of skaters) {
+        percentiles.push({
+          playerId: player.playerId,
+          percentiles: computePercentiles(player, peers, SKATER_KEYS, INVERTED_SKATER),
+        })
+      }
+    }
+
+    // Goalie percentiles
+    if (goalies.length > 0) {
+      const peers = await AggregatedStats.find({
+        isGoalie: true,
+        gamesPlayed: { $gte: MIN_GP_GOALIE },
+      })
+      for (const player of goalies) {
+        percentiles.push({
+          playerId: player.playerId,
+          percentiles: computePercentiles(player, peers, GOALIE_KEYS, INVERTED_GOALIE),
+        })
+      }
+    }
+
+    res.json({ aggregated, percentiles })
+  } catch (err) {
+    console.error("Batch fetch failed:", err)
+    res.status(500).json({ error: "Failed to fetch batch data" })
   }
 })
 
