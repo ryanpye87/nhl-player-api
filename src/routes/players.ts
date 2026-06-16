@@ -1,6 +1,7 @@
 import {Router, Request, Response } from 'express'
 import Player from '../models/Player'
 import PlayerCache from '../models/PlayerCache'
+import AggregatedStats from '../models/AggregatedStats'
 
 const router = Router()
 
@@ -48,6 +49,21 @@ router.get('/:id/stats', async (req: Request, res: Response) => {
         res.json({ ...data, fromCache: false})
     } catch (err) {
         res.status(500).json({ error: 'Failed to fetch player stats'})
+    }
+})
+
+// GET /players/:id/aggregated — return flat AggregatedStats for one player
+router.get('/:id/aggregated', async (req: Request, res: Response) => {
+    const playerId = parseInt(req.params.id as string)
+
+    try {
+        const doc = await AggregatedStats.findOne({ playerId })
+        if (!doc) {
+            return res.status(404).json({ error: 'Aggregated stats not found for this player' })
+        }
+        res.json(doc)
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch aggregated stats' })
     }
 })
 
