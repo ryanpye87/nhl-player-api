@@ -34,8 +34,8 @@ Raw NHL API response blobs, one document per player.
 
 The `data` object contains `seasonTotals` — an array of per-season stat lines — plus player info, headshot URLs, current team, etc.
 
-### `AggregatedStats` collection *(planned)*
-Flat, queryable stat documents — one per player, extracted from `PlayerCache` for the current NHL regular season. Enables efficient percentile computation across the entire league.
+### `AggregatedStats` collection
+Flat, queryable stat documents — one per player, populated by `POST /players/aggregate` from the NHL stats API (not from `PlayerCache`). Enables efficient percentile computation across the entire league.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -68,20 +68,45 @@ Flat, queryable stat documents — one per player, extracted from `PlayerCache` 
 
 ## API Endpoints
 
-### Current
+### Players
 
 | Method | Path | Description | Cache |
 |--------|------|-------------|-------|
 | `GET` | `/players` | All active NHL players (sorted by name) | DB (static) |
 | `GET` | `/players/:id/stats` | Raw NHL player landing data | DB (24hr TTL) |
+| `GET` | `/players/:id/aggregated` | Aggregated season stats for one player | DB (pre-computed) |
+| `POST` | `/players/batch` | Aggregated stats + percentiles for 1–100 players | DB (pre-computed) |
 
-### Planned
+### Stats
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/stats/aggregate` | Process all PlayerCache entries → upsert into AggregatedStats |
-| `GET` | `/stats/aggregated` | Return all AggregatedStats documents (filterable by `?isGoalie=`) |
-| `GET` | `/stats/percentiles/:playerId` | Return 0–99 percentile ranks for a player vs. all qualified peers |
+| `POST` | `/players/aggregate` | Fetch all skater + goalie stats from NHL API → upsert into AggregatedStats |
+| `GET` | `/players/aggregated` | Return all AggregatedStats documents (filterable by `?isGoalie=`) |
+| `GET` | `/players/percentiles/:playerId` | Return 0–99 percentile ranks for a player vs. all qualified peers |
+
+All stats routes are mounted at `/players` alongside the player routes, matching the SPA's route structure.
+
+#### `POST /players/batch` — request & response
+
+```json
+// Request
+{ "ids": [8478402, 8476454] }
+
+// Response
+{
+  "aggregated": [
+    { "playerId": 8478402, "fullName": "Connor McDavid", "isGoalie": false, "goals": 48, "assists": 90, ... },
+    { "playerId": 8476454, "fullName": "Sidney Crosby", "isGoalie": false, "goals": 35, "assists": 52, ... }
+  ],
+  "percentiles": [
+    { "playerId": 8478402, "percentiles": { "goals": 99, "assists": 99, ... } },
+    { "playerId": 8476454, "percentiles": { "goals": 91, "assists": 85, ... } }
+  ]
+}
+```
+
+Percentiles are computed per position-type group (skaters vs. skaters, goalies vs. goalies) with a shared peer fetch — two skaters in one batch share the same peer query.
 
 #### `GET /stats/percentiles/:playerId` response shape
 
@@ -113,22 +138,38 @@ All values are 0–99. Players with fewer than 10 games played are excluded from
 ## Architecture
 
 ```
-                    ┌──────────────┐
-                    │  NHL Web API │  (api-web.nhle.com)
-                    └──────┬───────┘
-                           │  fetch on cache miss
-                    ┌──────▼───────┐
-                    │  PlayerCache │  (MongoDB, 24hr TTL)
-                    └──────┬───────┘
-                           │  POST /stats/aggregate
-                    ┌──────▼──────────┐
-                    │ AggregatedStats │  (MongoDB, flat & queryable)
-                    └──────┬──────────┘
-                           │  GET /stats/percentiles/:id
-                    ┌──────▼───────┐
-                    │  Frontend    │  (nhl-player-app)
-                    └──────────────┘
+                         ┌───────────────────┐
+                         │  NHL Stats API    │  (api.nhle.com)
+                         │  NHL Web API      │  (api-web.nhle.com)
+                         └────┬──────┬───────┘
+                              │      │
+              POST /aggregate │      │ GET /players/:id/stats
+              (batch ingest)  │      │ (lazy, per-player)
+                              │      │
+                    ┌─────────▼──────▼─────────┐
+                    │       MongoDB Atlas       │
+                    │  ┌─────────────────────┐  │
+                    │  │ AggregatedStats     │  │  ← pre-computed, queryable
+                    │  │ (flat season stats) │  │
+                    │  └─────────────────────┘  │
+                    │  ┌─────────────────────┐  │
+                    │  │ PlayerCache         │  │  ← 24hr TTL, raw JSON blobs
+                    │  └─────────────────────┘  │
+                    │  ┌─────────────────────┐  │
+                    │  │ Player              │  │  ← canonical roster
+                    │  └─────────────────────┘  │
+                    └────────────┬──────────────┘
+                                 │
+                      POST /players/batch
+                      GET /players/aggregated
+                      GET /players/percentiles/:id
+                                 │
+                    ┌────────────▼──────────────┐
+                    │  nhl-player-app (SPA)      │
+                    └───────────────────────────┘
 ```
+
+The hot path is `POST /players/batch` — one request returns everything the SPA needs for a two-player comparison, with percentile peer queries shared across players of the same position type.
 
 ---
 
@@ -150,15 +191,49 @@ The following stats use `players_with_higher_value` (lower raw = better):
 - **Goalies:** GAA (goals against average), losses
 
 ### TOI parsing
-The NHL API returns `avgToi` as a string `"mm:ss"`. It is parsed to decimal minutes: `minutes + (seconds / 60)`.
+The NHL stats API returns `timeOnIcePerGame` in seconds. It is converted to decimal minutes at aggregation time: `seconds / 60`. The `avgToi` field in `AggregatedStats` is always decimal minutes (e.g., 22.5 = 22:30).
+
+---
+
+## Testing Strategy
+
+### Test Layers
+
+```
+┌─────────────────────────────────────────┐
+│  E2E (Playwright)                       │
+│  Real HTTP requests → real Express      │
+│  → real MongoDB                         │  ← catches: route registration,
+│                                             response shapes, status codes,
+│                                             cross-endpoint consistency
+├─────────────────────────────────────────┤
+│  Type-check (TypeScript compiler)       │
+│  tsc --noEmit                           │  ← catches: type errors, missing
+│                                             imports, broken interfaces
+└─────────────────────────────────────────┘
+```
+
+**Playwright E2E tests** ([`e2e/api.spec.ts`](../e2e/api.spec.ts)) use the `request` fixture (no browser) to hit every endpoint and verify response shapes, status codes, and cross-endpoint data consistency. The aggregate test has a 2-minute timeout because it hits the real NHL API; all other tests complete in < 1s.
+
+### Running
+
+```bash
+npm run dev                          # Terminal 1: start server (required)
+npx playwright test                  # Terminal 2: run E2E suite
+npx playwright test --reporter=list  # Verbose output
+```
 
 ---
 
 ## Future Roadmap
 
-- **Multi-season aggregation** — store stats for multiple seasons, not just the latest
-- **Advanced stats integration** — ingest xGF, xGA, Corsi from Natural Stat Trick or Evolving-Hockey
-- **Percentile caching** — pre-compute and cache percentile rankings to avoid O(n) scans per request
-- **Position-group filtering** — percentiles scoped to position (C vs. C, D vs. D, etc.)
-- **Rookie filtering** — percentiles scoped to first-year players
-- **Rate limiting** — protect the NHL API from excessive requests during cache refresh storms
+- [x] Aggregated stats collection (`POST /players/aggregate`)
+- [x] Percentile computation (`GET /players/percentiles/:playerId`)
+- [x] Batch endpoint for frontend (`POST /players/batch`)
+- [x] E2E API tests (Playwright)
+- [ ] Multi-season aggregation — store stats for multiple seasons, not just the latest
+- [ ] Advanced stats integration — ingest xGF, xGA, Corsi from Natural Stat Trick or Evolving-Hockey
+- [ ] Percentile caching — pre-compute and cache percentile rankings to avoid O(n) scans per request
+- [ ] Position-group filtering — percentiles scoped to position (C vs. C, D vs. D, etc.)
+- [ ] Rookie filtering — percentiles scoped to first-year players
+- [ ] Rate limiting — protect the NHL API from excessive requests during cache refresh storms
